@@ -1,0 +1,53 @@
+# LD3-D Configuration: MDLM on text8
+# Model: MDLM (Masked Diffusion Language Model)
+# Dataset: text8
+# Reference: Sahoo et al. (NeurIPS 2024)
+
+# === Model ===
+model_type: mdlm
+diffusion_type: absorbing
+vocab_size: 27  # text8: 26 letters + space (+ MASK = 28)
+seq_length: 256
+ckp_path: null  # Path to pre-trained MDLM checkpoint
+
+# === Noise Schedule ===
+noise_schedule: log_linear  # log_linear, linear, cosine
+T: 1.0
+eps: 1e-4
+
+# === Solver ===
+solver_name: tau_leaping  # tau_leaping, analytic
+steps: 32  # NFE budget for student
+teacher_steps: 1024  # NFE for teacher data generation
+skip_type: uniform  # Baseline schedule type
+
+# === LD3-D Training ===
+time_mode: time  # 'time' or 'rate_integral'
+loss_type: cross_entropy
+theory_proxy_weight: 0.01  # Weight for theory-motivated proxy loss
+temperature: 1.0
+
+# Learning rates
+lr_time_1: 0.005  # Phase 1 (coarse schedule)
+lr_time_2: 0.1    # Phase 2 (perturbations, scaled by 1/steps)
+min_lr_time_1: 5e-5
+min_lr_time_2: 1e-6
+lr_time_decay: 0.8
+momentum_time_1: 0.9
+win_rate: 0.5
+
+# Training rounds
+training_rounds_v1: 3
+training_rounds_v2: 5
+patient: 5
+lr2_patient: 5
+
+# Data
+data_dir: data/discrete_teacher/mdlm_text8
+num_train: 50
+num_valid: 25
+train_batch_size: 8
+valid_batch_size: 8
+
+# Output
+snapshot_path: logs/discrete/mdlm_text8

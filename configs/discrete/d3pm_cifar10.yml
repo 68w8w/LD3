@@ -1,0 +1,53 @@
+# LD3-D Configuration: D3PM on CIFAR-10 (VQ-tokenized)
+# Model: D3PM with VQ-VAE tokenized images
+# Dataset: CIFAR-10
+# Reference: Austin et al. (NeurIPS 2021)
+
+# === Model ===
+model_type: d3pm
+diffusion_type: absorbing
+vocab_size: 512  # VQ-VAE codebook size (+ MASK = 513)
+seq_length: 256  # 16x16 VQ tokens
+ckp_path: null
+
+# === Noise Schedule ===
+noise_schedule: cosine
+T: 1.0
+eps: 1e-4
+
+# === Solver ===
+solver_name: analytic  # Use exact matrix exponential
+steps: 32
+teacher_steps: 512
+skip_type: uniform
+
+# === LD3-D Training ===
+time_mode: time
+loss_type: cross_entropy
+theory_proxy_weight: 0.01
+temperature: 1.0
+
+# Learning rates
+lr_time_1: 0.005
+lr_time_2: 0.1
+min_lr_time_1: 5e-5
+min_lr_time_2: 1e-6
+lr_time_decay: 0.8
+momentum_time_1: 0.9
+win_rate: 0.5
+
+# Training rounds
+training_rounds_v1: 3
+training_rounds_v2: 5
+patient: 5
+lr2_patient: 5
+
+# Data
+data_dir: data/discrete_teacher/d3pm_cifar10
+num_train: 50
+num_valid: 25
+train_batch_size: 4
+valid_batch_size: 4
+
+# Output
+snapshot_path: logs/discrete/d3pm_cifar10
