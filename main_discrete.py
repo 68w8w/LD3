@@ -157,6 +157,15 @@ def main():
                         help='GPU device ID')
     parser.add_argument('--placeholder_data', action='store_true',
                         help='Generate and use placeholder data for testing')
+    parser.add_argument('--gen_ppl', action='store_true',
+                        help='Compute Generative PPL via GPT-2 Large after training/eval')
+    parser.add_argument('--gen_ppl_model', type=str, default='gpt2-large',
+                        choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'],
+                        help='AR model for Gen PPL scoring')
+    parser.add_argument('--gen_ppl_samples', type=int, default=200,
+                        help='Number of samples for Gen PPL')
+    parser.add_argument('--source_tokenizer', type=str, default='text8',
+                        help='Tokenizer used by diffusion model (text8, bytes, gpt2)')
     args = parser.parse_args()
 
     # Load config
@@ -243,6 +252,36 @@ def main():
         logging.info(f"Schedule: {ts1.detach().cpu().tolist()}")
     else:
         trainer.train()
+
+    # Generative PPL evaluation (standard protocol: generate + score with GPT-2)
+    if args.gen_ppl:
+        from compute_gen_ppl import evaluate_gen_ppl
+        logging.info("\n" + "=" * 60)
+        logging.info("Running Generative PPL evaluation (MDLM/SEDD protocol)")
+        logging.info(f"  Eval model: {args.gen_ppl_model}")
+        logging.info(f"  Num samples: {args.gen_ppl_samples}")
+        logging.info("=" * 60)
+
+        schedule_path = args.load_from
+        if schedule_path is None:
+            # Use the checkpoint from training
+            schedule_path = os.path.join(
+                config.get('snapshot_path', 'logs/discrete'), 'best_discrete.pt'
+            )
+
+        gen_ppl_results = evaluate_gen_ppl(
+            model=model,
+            noise_schedule=noise_schedule,
+            solver=solver,
+            schedule_path=schedule_path if os.path.exists(schedule_path) else None,
+            eval_model_name=args.gen_ppl_model,
+            source_tokenizer=args.source_tokenizer,
+            num_samples=args.gen_ppl_samples,
+            seq_length=config.get('seq_length', 256),
+            batch_size=config.get('valid_batch_size', 8),
+            diffusion_type=config.get('diffusion_type', 'absorbing'),
+            device=device,
+        )
 
     logging.info("Done!")
 
