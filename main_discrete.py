@@ -236,8 +236,9 @@ def main():
         logging.info(f"Loaded schedule from {args.load_from}")
 
     if args.eval_only:
-        val_loss = trainer._run_validation()
-        logging.info(f"Validation loss: {val_loss:.6f}")
+        val_loss, val_ppl, val_acc = trainer._run_validation()
+        logging.info(f"Validation CE: {val_loss:.6f} | PPL: {val_ppl:.2f} | Acc: {val_acc:.4f}")
+        trainer._evaluate_baselines()
         ts1, ts2 = trainer._get_schedule()
         logging.info(f"Schedule: {ts1.detach().cpu().tolist()}")
     else:

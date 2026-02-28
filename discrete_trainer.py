@@ -471,6 +471,9 @@ class LD3DTrainer:
     def _run_validation(self):
         """Run validation and return average loss."""
         total_loss = 0.0
+        total_ce = 0.0
+        total_tokens = 0
+        total_correct = 0
         count = 0
 
         with torch.no_grad():
@@ -485,9 +488,28 @@ class LD3DTrainer:
                 )
                 loss = self._compute_loss(p_final, teacher_tokens, ts1)
                 total_loss += loss.item()
+
+                # Compute per-token cross-entropy for PPL
+                B, L, K = p_final.shape
+                log_probs = torch.log(p_final + 1e-10)
+                target_log_probs = log_probs.gather(
+                    dim=-1, index=teacher_tokens.unsqueeze(-1)
+                ).squeeze(-1)  # [B, L]
+                total_ce += -target_log_probs.sum().item()
+                total_tokens += B * L
+
+                # Token-level accuracy
+                preds = p_final.argmax(dim=-1)  # [B, L]
+                total_correct += (preds == teacher_tokens).sum().item()
+
                 count += 1
 
-        return total_loss / max(count, 1)
+        avg_loss = total_loss / max(count, 1)
+        avg_ce = total_ce / max(total_tokens, 1)
+        ppl = math.exp(min(avg_ce, 100))  # Clamp to avoid overflow
+        accuracy = total_correct / max(total_tokens, 1)
+
+        return avg_loss, ppl, accuracy
 
     def _save_checkpoint(self):
         """Save best model checkpoint."""
@@ -566,9 +588,12 @@ class LD3DTrainer:
 
     def _examine_checkpoint(self):
         """Evaluate, save if improved, decay LR if plateau."""
-        val_loss = self._run_validation()
-        logging.info(f"{self._current_version} Iter {self.cur_iter} | "
-                     f"Val loss: {val_loss:.6f} | Best: {self.best_loss:.6f}")
+        val_loss, val_ppl, val_acc = self._run_validation()
+        logging.info(
+            f"{self._current_version} Iter {self.cur_iter} | "
+            f"Val loss: {val_loss:.6f} | PPL: {val_ppl:.2f} | "
+            f"Acc: {val_acc:.4f} | Best loss: {self.best_loss:.6f}"
+        )
 
         if val_loss < self.best_loss:
             self.best_loss = val_loss
@@ -674,9 +699,13 @@ class LD3DTrainer:
             self.cur_round += 1
 
         # Final evaluation
+        logging.info("=" * 60)
         logging.info("Training complete. Final evaluation:")
-        final_loss = self._run_validation()
-        logging.info(f"Final validation loss: {final_loss:.6f}")
+        final_loss, final_ppl, final_acc = self._run_validation()
+        logging.info(f"  Learned schedule -> CE: {final_loss:.6f} | PPL: {final_ppl:.2f} | Acc: {final_acc:.4f}")
+
+        # Compare with baselines
+        self._evaluate_baselines()
 
         # Log learned schedule
         ts1, ts2 = self._get_schedule()
@@ -684,6 +713,111 @@ class LD3DTrainer:
         logging.info(f"Learned schedule (perturbed): {ts2.detach().cpu().tolist()}")
 
         self._visual_schedule()
+
+    def _evaluate_with_schedule(self, timesteps1, timesteps2, label=''):
+        """Evaluate a specific schedule and return PPL.
+
+        Args:
+            timesteps1: Primary schedule [N+1]
+            timesteps2: Perturbed schedule [N+1]
+            label: Name for logging
+
+        Returns:
+            avg_loss, ppl, accuracy
+        """
+        total_ce = 0.0
+        total_tokens = 0
+        total_correct = 0
+
+        from discrete_samplers.probability_flow import ProbabilityFlowSolver
+        pf_solver = ProbabilityFlowSolver(
+            self.noise_schedule, self.diffusion_type, self.temperature
+        )
+
+        def score_fn(p, t, condition=None):
+            if hasattr(self.net, 'soft'):
+                return self.net.soft(p, t, condition)
+            else:
+                return self.net(p, t, condition)
+
+        with torch.no_grad():
+            for noise_tokens, teacher_tokens, condition in self.valid_loader:
+                noise_tokens = noise_tokens.to(self.device)
+                teacher_tokens = teacher_tokens.to(self.device)
+                if condition is not None:
+                    condition = condition.to(self.device)
+
+                B, L = noise_tokens.shape
+
+                if self.diffusion_type == 'absorbing':
+                    mask_idx = self.noise_schedule.mask_index
+                    p_init = torch.zeros(B, L, self.K, device=self.device)
+                    p_init[:, :, mask_idx] = 1.0
+                else:
+                    p_init = torch.ones(B, L, self.K, device=self.device) / self.K
+
+                ts1_dev = timesteps1.to(self.device)
+                ts2_dev = timesteps2.to(self.device)
+
+                p_final = pf_solver.sample_probability_flow(
+                    score_fn, p_init, ts1_dev, ts2_dev, condition
+                )
+
+                log_probs = torch.log(p_final + 1e-10)
+                target_log_probs = log_probs.gather(
+                    dim=-1, index=teacher_tokens.unsqueeze(-1)
+                ).squeeze(-1)
+                total_ce += -target_log_probs.sum().item()
+                total_tokens += B * L
+
+                preds = p_final.argmax(dim=-1)
+                total_correct += (preds == teacher_tokens).sum().item()
+
+        avg_ce = total_ce / max(total_tokens, 1)
+        ppl = math.exp(min(avg_ce, 100))
+        accuracy = total_correct / max(total_tokens, 1)
+
+        return avg_ce, ppl, accuracy
+
+    def _evaluate_baselines(self):
+        """Evaluate all baseline schedules and compare with learned schedule.
+
+        Outputs a comparison table of CE, PPL, and Accuracy.
+        """
+        logging.info("-" * 60)
+        logging.info(f"{'Schedule':<25} {'CE':>8} {'PPL':>10} {'Acc':>8}")
+        logging.info("-" * 60)
+
+        baselines = {
+            'Uniform (time)': (self.baseline_uniform, self.baseline_uniform),
+            'Uniform (rate-integral)': (self.baseline_rate_uniform, self.baseline_rate_uniform),
+            'Quadratic': (self.baseline_quadratic, self.baseline_quadratic),
+        }
+
+        results = {}
+        for name, (ts1, ts2) in baselines.items():
+            ce, ppl, acc = self._evaluate_with_schedule(ts1, ts2, name)
+            logging.info(f"  {name:<23} {ce:>8.4f} {ppl:>10.2f} {acc:>8.4f}")
+            results[name] = {'ce': ce, 'ppl': ppl, 'acc': acc}
+
+        # Learned schedule
+        ts1_learned, ts2_learned = self._get_schedule()
+        ce, ppl, acc = self._evaluate_with_schedule(
+            ts1_learned.detach(), ts2_learned.detach(), 'Learned (LD3-D)'
+        )
+        logging.info(f"  {'Learned (LD3-D)':<23} {ce:>8.4f} {ppl:>10.2f} {acc:>8.4f}")
+        results['Learned (LD3-D)'] = {'ce': ce, 'ppl': ppl, 'acc': acc}
+
+        logging.info("-" * 60)
+
+        # Compute improvements
+        best_baseline_ppl = min(r['ppl'] for name, r in results.items() if name != 'Learned (LD3-D)')
+        learned_ppl = results['Learned (LD3-D)']['ppl']
+        if best_baseline_ppl > 0:
+            improvement = (best_baseline_ppl - learned_ppl) / best_baseline_ppl * 100
+            logging.info(f"PPL improvement over best baseline: {improvement:+.2f}%")
+
+        return results
 
     def get_learned_schedule(self):
         """Return the learned timestep schedule."""
