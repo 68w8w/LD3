@@ -166,6 +166,11 @@ def main():
                         help='Number of samples for Gen PPL')
     parser.add_argument('--source_tokenizer', type=str, default='text8',
                         help='Tokenizer used by diffusion model (text8, bytes, gpt2)')
+    parser.add_argument('--reference_file', type=str, default=None,
+                        help='Path to reference text file for BLEU metrics (one text per line)')
+    parser.add_argument('--tokenize', type=str, default='char',
+                        choices=['char', 'word'],
+                        help='Tokenization for text metrics (char for text8, word for BPE models)')
     args = parser.parse_args()
 
     # Load config
@@ -253,13 +258,14 @@ def main():
     else:
         trainer.train()
 
-    # Generative PPL evaluation (standard protocol: generate + score with GPT-2)
+    # Full generation evaluation (Gen PPL + diversity + entropy + degeneracy metrics)
     if args.gen_ppl:
         from compute_gen_ppl import evaluate_gen_ppl
         logging.info("\n" + "=" * 60)
-        logging.info("Running Generative PPL evaluation (MDLM/SEDD protocol)")
+        logging.info("Running full generation evaluation (MDLM/SEDD protocol + metrics)")
         logging.info(f"  Eval model: {args.gen_ppl_model}")
         logging.info(f"  Num samples: {args.gen_ppl_samples}")
+        logging.info(f"  Metrics tokenization: {args.tokenize}")
         logging.info("=" * 60)
 
         schedule_path = args.load_from
@@ -268,6 +274,13 @@ def main():
             schedule_path = os.path.join(
                 config.get('snapshot_path', 'logs/discrete'), 'best_discrete.pt'
             )
+
+        # Load reference texts if provided
+        reference_texts = None
+        if args.reference_file and os.path.exists(args.reference_file):
+            with open(args.reference_file, 'r') as f:
+                reference_texts = [line.strip() for line in f if line.strip()]
+            logging.info(f"  Loaded {len(reference_texts)} reference texts")
 
         gen_ppl_results = evaluate_gen_ppl(
             model=model,
@@ -281,6 +294,8 @@ def main():
             batch_size=config.get('valid_batch_size', 8),
             diffusion_type=config.get('diffusion_type', 'absorbing'),
             device=device,
+            reference_texts=reference_texts,
+            tokenize=args.tokenize,
         )
 
     logging.info("Done!")

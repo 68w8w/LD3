@@ -1,14 +1,23 @@
 """
-Generative Perplexity (Gen PPL) evaluation for LD3-D.
+Generative evaluation for LD3-D.
 
 Standard evaluation protocol for discrete diffusion text generation:
   1. Generate N text samples using the discrete diffusion model + learned schedule
   2. Decode tokens to text strings
-  3. Re-tokenize with GPT-2's tokenizer
-  4. Compute perplexity under GPT-2 Large (or other AR model)
+  3. Compute Gen PPL: re-tokenize with GPT-2, score with AR model
+  4. Compute comprehensive text metrics (diversity, degeneracy, etc.)
 
-This follows the exact protocol used by MDLM (Sahoo et al., NeurIPS 2024)
-and SEDD (Lou et al., ICML 2024).
+Metrics computed:
+  - Gen PPL (GPT-2 Large) and BPC — generation quality
+  - Distinct-1/2/3/4 — n-gram diversity
+  - Self-BLEU — inter-sample diversity (lower = more diverse)
+  - Unigram/Bigram Entropy — information content
+  - Repetition rate (3-gram, 5-gram) — degeneracy detection
+  - Zipf coefficient — naturalness of token distribution
+  - BLEU vs reference (optional) — reference-based quality
+
+This follows the protocol used by MDLM (Sahoo et al., NeurIPS 2024)
+and SEDD (Lou et al., ICML 2024), extended with additional metrics.
 
 Usage:
     python compute_gen_ppl.py \
@@ -193,6 +202,9 @@ def compute_generative_perplexity(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    # Also return texts for downstream metric computation
+    results['_texts'] = texts
+
     return gen_ppl, results
 
 
@@ -364,10 +376,14 @@ def evaluate_gen_ppl(
     diffusion_type='absorbing',
     device=None,
     baselines=None,
+    reference_texts=None,
+    tokenize='char',
 ):
-    """Full Gen PPL evaluation: generate + score.
+    """Full generation evaluation: generate + score Gen PPL + compute all metrics.
 
     Evaluates the learned schedule and optionally compares with baselines.
+    For each schedule, reports Gen PPL plus diversity, entropy, degeneracy,
+    and reference-based metrics.
 
     Args:
         model: Discrete diffusion model.
@@ -382,32 +398,56 @@ def evaluate_gen_ppl(
         diffusion_type: 'absorbing' or 'uniform'.
         device: Torch device.
         baselines: List of (name, schedule_path_or_None, skip_type) to compare.
+        reference_texts: Optional list of reference strings for BLEU.
+        tokenize: 'char' or 'word' for text metrics tokenization.
 
     Returns:
-        results: Dict mapping schedule_name -> gen_ppl.
+        results: Dict mapping schedule_name -> dict of all metrics.
     """
+    from compute_metrics import compute_all_metrics, format_metrics_table
+
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     results = {}
 
-    # Evaluate learned schedule
-    if schedule_path:
-        logging.info("=" * 60)
-        logging.info("Evaluating LEARNED schedule (LD3-D)")
-        logging.info("=" * 60)
+    def _evaluate_schedule(name, sched_path, skip_type='uniform'):
+        """Generate samples for a schedule and compute all metrics."""
         samples = generate_samples_with_schedule(
-            model, noise_schedule, solver, schedule_path,
+            model, noise_schedule, solver, sched_path,
             num_samples=num_samples, seq_length=seq_length,
             batch_size=batch_size, diffusion_type=diffusion_type,
-            device=device,
+            skip_type=skip_type, device=device,
         )
         gen_ppl, detail = compute_generative_perplexity(
             samples, eval_model_name=eval_model_name,
             source_tokenizer=source_tokenizer,
             eval_batch_size=batch_size, device=device,
         )
-        results['Learned (LD3-D)'] = gen_ppl
+        texts = detail.get('_texts', [])
+
+        # Compute all text metrics
+        all_metrics = compute_all_metrics(
+            generated_texts=texts,
+            reference_texts=reference_texts,
+            gen_ppl=gen_ppl,
+            tokenize=tokenize,
+        )
+
+        # Log full metrics table
+        table = format_metrics_table(all_metrics, title=f"Metrics: {name}")
+        logging.info("\n" + table)
+
+        return all_metrics
+
+    # Evaluate learned schedule
+    if schedule_path:
+        logging.info("=" * 60)
+        logging.info("Evaluating LEARNED schedule (LD3-D)")
+        logging.info("=" * 60)
+        results['Learned (LD3-D)'] = _evaluate_schedule(
+            'Learned (LD3-D)', schedule_path
+        )
 
     # Evaluate baselines
     if baselines is None:
@@ -421,40 +461,109 @@ def evaluate_gen_ppl(
         logging.info("=" * 60)
         logging.info(f"Evaluating baseline: {name}")
         logging.info("=" * 60)
-        samples = generate_samples_with_schedule(
-            model, noise_schedule, solver, sched_path,
-            num_samples=num_samples, seq_length=seq_length,
-            batch_size=batch_size, diffusion_type=diffusion_type,
-            skip_type=skip_type, device=device,
-        )
-        gen_ppl, detail = compute_generative_perplexity(
-            samples, eval_model_name=eval_model_name,
-            source_tokenizer=source_tokenizer,
-            eval_batch_size=batch_size, device=device,
-        )
-        results[name] = gen_ppl
+        results[name] = _evaluate_schedule(name, sched_path, skip_type)
 
-    # Print comparison table
-    logging.info("\n" + "=" * 60)
-    logging.info(f"{'GENERATIVE PPL COMPARISON':^60}")
-    logging.info(f"{'(eval model: ' + eval_model_name + ')':^60}")
-    logging.info("=" * 60)
-    logging.info(f"  {'Schedule':<30} {'Gen PPL':>10}")
-    logging.info("-" * 60)
-    for name, ppl in sorted(results.items(), key=lambda x: x[1]):
-        marker = " <-- best" if ppl == min(results.values()) else ""
-        logging.info(f"  {name:<30} {ppl:>10.2f}{marker}")
-    logging.info("=" * 60)
-
-    if 'Learned (LD3-D)' in results:
-        learned_ppl = results['Learned (LD3-D)']
-        baseline_ppls = {k: v for k, v in results.items() if k != 'Learned (LD3-D)'}
-        if baseline_ppls:
-            best_baseline = min(baseline_ppls.values())
-            improvement = (best_baseline - learned_ppl) / best_baseline * 100
-            logging.info(f"  LD3-D improvement over best baseline: {improvement:+.2f}%")
+    # Print comparison table (all metrics side by side)
+    _print_comparison_table(results, eval_model_name)
 
     return results
+
+
+def _print_comparison_table(results, eval_model_name):
+    """Print a side-by-side comparison table of key metrics across schedules."""
+    if not results:
+        return
+
+    # Key metrics to compare
+    key_metrics = [
+        ('gen_ppl', 'Gen PPL', False),       # (key, display, higher_is_better)
+        ('bpc', 'BPC', False),
+        ('distinct-1', 'Distinct-1', True),
+        ('distinct-2', 'Distinct-2', True),
+        ('distinct-3', 'Distinct-3', True),
+        ('self-bleu', 'Self-BLEU', False),
+        ('unigram_entropy', 'Unigram Ent.', True),
+        ('repetition_rate_3gram', 'Rep. Rate 3g', False),
+        ('zipf_coefficient', 'Zipf Coeff.', None),  # None = closer to 1.0
+    ]
+
+    # Add reference BLEU if present
+    sample_metrics = next(iter(results.values()))
+    if 'bleu-4' in sample_metrics:
+        key_metrics.append(('bleu-4', 'BLEU-4', True))
+
+    schedule_names = list(results.keys())
+
+    logging.info("\n" + "=" * 80)
+    logging.info(f"{'COMPREHENSIVE EVALUATION COMPARISON':^80}")
+    logging.info(f"{'(eval model: ' + eval_model_name + ')':^80}")
+    logging.info("=" * 80)
+
+    # Header
+    col_w = 12
+    header = f"  {'Metric':<18}"
+    for name in schedule_names:
+        short = name[:col_w]
+        header += f" {short:>{col_w}}"
+    header += f" {'Best':>{col_w}}"
+    logging.info(header)
+    logging.info("-" * 80)
+
+    for key, display, higher_is_better in key_metrics:
+        vals = []
+        for name in schedule_names:
+            v = results[name].get(key)
+            vals.append(v)
+
+        # Skip if none have this metric
+        if all(v is None for v in vals):
+            continue
+
+        row = f"  {display:<18}"
+        valid_vals = [(v, i) for i, v in enumerate(vals) if v is not None]
+
+        # Determine best
+        if higher_is_better is None:
+            # Zipf: closest to 1.0
+            best_idx = min(valid_vals, key=lambda x: abs(x[0] - 1.0))[1] if valid_vals else -1
+        elif higher_is_better:
+            best_idx = max(valid_vals, key=lambda x: x[0])[1] if valid_vals else -1
+        else:
+            best_idx = min(valid_vals, key=lambda x: x[0])[1] if valid_vals else -1
+
+        for i, v in enumerate(vals):
+            if v is None:
+                row += f" {'N/A':>{col_w}}"
+            else:
+                marker = " *" if i == best_idx else "  "
+                if abs(v) >= 100:
+                    row += f" {v:>{col_w - 2}.2f}{marker}"
+                elif abs(v) >= 1:
+                    row += f" {v:>{col_w - 2}.4f}{marker}"
+                else:
+                    row += f" {v:>{col_w - 2}.6f}{marker}"
+
+        # Best schedule name
+        best_name = schedule_names[best_idx] if best_idx >= 0 else "N/A"
+        row += f" {best_name[:col_w]:>{col_w}}"
+
+        logging.info(row)
+
+    logging.info("=" * 80)
+    logging.info("  (* marks best for each metric)")
+
+    # Improvement summary for learned schedule
+    if 'Learned (LD3-D)' in results:
+        learned = results['Learned (LD3-D)']
+        baseline_results = {k: v for k, v in results.items() if k != 'Learned (LD3-D)'}
+        if baseline_results and 'gen_ppl' in learned:
+            best_baseline_ppl = min(
+                v.get('gen_ppl', float('inf')) for v in baseline_results.values()
+            )
+            learned_ppl = learned['gen_ppl']
+            if best_baseline_ppl > 0:
+                improvement = (best_baseline_ppl - learned_ppl) / best_baseline_ppl * 100
+                logging.info(f"\n  PPL improvement over best baseline: {improvement:+.2f}%")
 
 
 # ============================================================================
@@ -462,7 +571,7 @@ def evaluate_gen_ppl(
 # ============================================================================
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Compute Generative PPL for LD3-D')
+    parser = argparse.ArgumentParser(description='Evaluate LD3-D generation quality')
     parser.add_argument('--config', type=str, default=None,
                         help='Path to config YAML file')
     parser.add_argument('--load_from', type=str, default=None,
@@ -480,22 +589,44 @@ if __name__ == '__main__':
                         help='Tokenizer used by the diffusion model')
     parser.add_argument('--diffusion_type', type=str, default='absorbing')
     parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument('--reference_file', type=str, default=None,
+                        help='Path to reference text file (one text per line) for BLEU')
+    parser.add_argument('--tokenize', type=str, default='char',
+                        choices=['char', 'word'],
+                        help='Tokenization level for text metrics')
 
     args = parser.parse_args()
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
 
-    # For standalone testing: generate random tokens and compute Gen PPL
+    # Load reference texts if provided
+    reference_texts = None
+    if args.reference_file and os.path.exists(args.reference_file):
+        with open(args.reference_file, 'r') as f:
+            reference_texts = [line.strip() for line in f if line.strip()]
+        logging.info(f"Loaded {len(reference_texts)} reference texts from {args.reference_file}")
+
+    # For standalone testing: generate random tokens and compute all metrics
     if args.config is None:
-        logging.info("No config provided. Running standalone Gen PPL test with random tokens...")
+        from compute_metrics import compute_all_metrics, format_metrics_table
+
+        logging.info("No config provided. Running standalone test with random tokens...")
         vocab_size = 28  # text8
         fake_samples = torch.randint(0, 27, (args.num_samples, args.seq_length))
-        gen_ppl, results = compute_generative_perplexity(
+        gen_ppl, detail = compute_generative_perplexity(
             fake_samples,
             eval_model_name=args.eval_model,
             source_tokenizer=args.source_tokenizer,
             eval_batch_size=args.batch_size,
             device=device,
         )
+        texts = detail.get('_texts', [])
+        metrics = compute_all_metrics(
+            generated_texts=texts,
+            reference_texts=reference_texts,
+            gen_ppl=gen_ppl,
+            tokenize=args.tokenize,
+        )
+        logging.info("\n" + format_metrics_table(metrics, title="Standalone Test Metrics"))
     else:
         # Full evaluation with config
         import yaml
@@ -518,4 +649,6 @@ if __name__ == '__main__':
             batch_size=args.batch_size,
             diffusion_type=config.get('diffusion_type', 'absorbing'),
             device=device,
+            reference_texts=reference_texts,
+            tokenize=args.tokenize,
         )
